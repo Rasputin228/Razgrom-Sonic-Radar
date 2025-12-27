@@ -1,0 +1,7 @@
+numpy
+scipy
+soundcard
+flask
+flask-socketio
+keyboard
+pyinstaller
