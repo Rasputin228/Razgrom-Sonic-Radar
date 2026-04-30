@@ -76,7 +76,44 @@ COLOR_PROFILES = {
     },
 }
 
+PROFILE_PRESETS = {
+    "Custom": {},
+    "CS2 / footsteps": {
+        "sensitivity": 420.0,
+        "noise_floor": 0.026,
+        "sector_spread": 2,
+        "visual_mode": "minimal",
+        "color_profile": "contrast",
+        "opacity": 0.82,
+    },
+    "Tarkov / tactical": {
+        "sensitivity": 520.0,
+        "noise_floor": 0.032,
+        "sector_spread": 3,
+        "visual_mode": "radar",
+        "color_profile": "orange",
+        "opacity": 0.78,
+    },
+    "Arena Breakout": {
+        "sensitivity": 470.0,
+        "noise_floor": 0.028,
+        "sector_spread": 2,
+        "visual_mode": "minimal",
+        "color_profile": "blue",
+        "opacity": 0.84,
+    },
+    "Desktop test": {
+        "sensitivity": 260.0,
+        "noise_floor": 0.018,
+        "sector_spread": 1,
+        "visual_mode": "radar",
+        "color_profile": "orange",
+        "opacity": 0.9,
+    },
+}
+
 settings = {
+    "profile_name": "Custom",
     "sensitivity": SENSITIVITY,
     "size": 320,
     "opacity": 0.85,
@@ -180,6 +217,7 @@ def clamp(value, min_value, max_value):
     return max(min_value, min(max_value, value))
 
 def apply_saved_settings(saved_config):
+    settings["profile_name"] = saved_config.get("profile_name", settings["profile_name"])
     settings["sensitivity"] = float(saved_config.get("sensitivity", settings["sensitivity"]))
     settings["size"] = int(saved_config.get("size", settings["size"]))
     settings["opacity"] = float(saved_config.get("opacity", settings["opacity"]))
@@ -202,9 +240,12 @@ def apply_saved_settings(saved_config):
         settings["visual_mode"] = "radar"
     if settings["color_profile"] not in COLOR_PROFILES:
         settings["color_profile"] = "orange"
+    if settings["profile_name"] not in PROFILE_PRESETS:
+        settings["profile_name"] = "Custom"
 
 def build_saved_config(window, audio_source):
     return {
+        "profile_name": settings["profile_name"],
         "window": window,
         "audio": audio_source.get("name") if audio_source else selected_speaker_id,
         "audio_kind": audio_source.get("kind") if audio_source else "loopback",
@@ -235,6 +276,45 @@ def measure_noise_floor(source, sensitivity, seconds=3.0):
 
     percentile = float(np.percentile(levels, 90))
     return clamp(percentile * 1.7, 0.006, 0.25)
+
+def diagnose_audio_source(source, sensitivity, seconds=1.0):
+    levels = []
+    balances = []
+    centroids = []
+    frames = max(1, int(seconds * SAMPLE_RATE / BLOCK_SIZE))
+    with open_audio_recorder_source(source).recorder(samplerate=SAMPLE_RATE, channels=2, blocksize=BLOCK_SIZE) as recorder:
+        for _ in range(frames):
+            data = recorder.record(numframes=BLOCK_SIZE)
+            rms_l = math.sqrt(float(np.mean(data[:, 0] ** 2)))
+            rms_r = math.sqrt(float(np.mean(data[:, 1] ** 2)))
+            channel_sum = rms_l + rms_r
+            level = float(np.power(channel_sum * sensitivity, COMPRESSION))
+            balance = (rms_r - rms_l) / (channel_sum + 0.000001)
+            levels.append(level)
+            balances.append(balance)
+
+            freqs = np.fft.rfft(data[:, 0] + data[:, 1])
+            mags = np.abs(freqs)
+            mag_sum = np.sum(mags)
+            if mag_sum > 0:
+                centroids.append(float((np.sum(np.arange(len(mags)) * mags) / mag_sum) * (SAMPLE_RATE / BLOCK_SIZE)))
+
+    if not levels:
+        return {
+            "level": 0.0,
+            "peak": 0.0,
+            "balance": 0.0,
+            "centroid": 0.0,
+            "frames": 0,
+        }
+
+    return {
+        "level": float(np.mean(levels)),
+        "peak": float(np.max(levels)),
+        "balance": float(np.mean(balances)),
+        "centroid": float(np.mean(centroids)) if centroids else 0.0,
+        "frames": len(levels),
+    }
 
 def show_launcher():
     global target_window_title, selected_speaker_id, selected_audio_source
@@ -304,7 +384,29 @@ def show_launcher():
     sector_spread_var = tk.IntVar(value=settings["sector_spread"])
     noise_floor_var = tk.DoubleVar(value=settings["noise_floor"])
     visual_mode_var = tk.StringVar(value=settings["visual_mode"])
-    profile_var = tk.StringVar(value=settings["color_profile"])
+    color_profile_var = tk.StringVar(value=settings["color_profile"])
+    preset_var = tk.StringVar(value=settings["profile_name"])
+
+    preset_row = tk.Frame(settings_frame, bg="#111")
+    preset_row.pack(fill="x", pady=(0, 6))
+    tk.Label(preset_row, text="Профиль", bg="#111", fg="#ddd", width=15, anchor="w").pack(side="left")
+    preset_combo = ttk.Combobox(preset_row, textvariable=preset_var, state="readonly", width=22)
+    preset_combo["values"] = list(PROFILE_PRESETS.keys())
+    preset_combo.pack(side="left")
+
+    def apply_preset(_event=None):
+        preset = PROFILE_PRESETS.get(preset_var.get(), {})
+        if not preset:
+            return
+        sensitivity_var.set(preset.get("sensitivity", sensitivity_var.get()))
+        noise_floor_var.set(preset.get("noise_floor", noise_floor_var.get()))
+        sector_spread_var.set(preset.get("sector_spread", sector_spread_var.get()))
+        visual_mode_var.set(preset.get("visual_mode", visual_mode_var.get()))
+        color_profile_var.set(preset.get("color_profile", color_profile_var.get()))
+        opacity_var.set(preset.get("opacity", opacity_var.get()))
+        update_profile_hint()
+
+    preset_combo.bind("<<ComboboxSelected>>", apply_preset)
 
     def add_scale(label, variable, from_, to_, resolution=1):
         row = tk.Frame(settings_frame, bg="#111")
@@ -326,14 +428,14 @@ def show_launcher():
     profile_row = tk.Frame(settings_frame, bg="#111")
     profile_row.pack(fill="x", pady=6)
     tk.Label(profile_row, text="Цвета", bg="#111", fg="#ddd", width=15, anchor="w").pack(side="left")
-    profile_combo = ttk.Combobox(profile_row, textvariable=profile_var, state="readonly", width=22)
+    profile_combo = ttk.Combobox(profile_row, textvariable=color_profile_var, state="readonly", width=22)
     profile_combo["values"] = list(COLOR_PROFILES.keys())
     profile_combo.pack(side="left")
-    profile_hint = tk.Label(profile_row, text=COLOR_PROFILES[profile_var.get()]["name"], bg="#111", fg="#aaa")
+    profile_hint = tk.Label(profile_row, text=COLOR_PROFILES[color_profile_var.get()]["name"], bg="#111", fg="#aaa")
     profile_hint.pack(side="left", padx=8)
 
     def update_profile_hint(_event=None):
-        profile_hint.config(text=COLOR_PROFILES.get(profile_var.get(), COLOR_PROFILES["orange"])["name"])
+        profile_hint.config(text=COLOR_PROFILES.get(color_profile_var.get(), COLOR_PROFILES["orange"])["name"])
 
     profile_combo.bind("<<ComboboxSelected>>", update_profile_hint)
 
@@ -378,6 +480,36 @@ def show_launcher():
         noise_floor_var.set(round(value, 3))
         calibration_status.config(text=f"Порог шума установлен: {value:.3f}", fg="#66ff99")
 
+    def run_audio_diagnostics():
+        source = selected_source_from_list()
+        calibration_status.config(text="Диагностика: измеряю источник 1 секунду...", fg="#ffcc66")
+        diagnostics_button.config(state="disabled")
+
+        def worker():
+            try:
+                report = diagnose_audio_source(source, float(sensitivity_var.get()), seconds=1.0)
+                root.after(0, lambda: finish_diagnostics(report, None))
+            except Exception as e:
+                error_text = str(e)
+                root.after(0, lambda: finish_diagnostics(None, error_text))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_diagnostics(report, error):
+        diagnostics_button.config(state="normal")
+        if error:
+            calibration_status.config(text=f"Диагностика не удалась: {error}", fg="#ff6666")
+            return
+        side = "CENTER"
+        if report["balance"] > 0.12:
+            side = "RIGHT"
+        elif report["balance"] < -0.12:
+            side = "LEFT"
+        calibration_status.config(
+            text=f"AVG {report['level']:.3f} | PEAK {report['peak']:.3f} | {side} | {report['centroid']:.0f} Hz",
+            fg="#66ff99"
+        )
+
     calibrate_button = tk.Button(
         settings_frame,
         text="КАЛИБРОВАТЬ ТИШИНУ 3 СЕК",
@@ -388,6 +520,17 @@ def show_launcher():
         command=run_noise_calibration
     )
     calibrate_button.pack(fill="x", pady=(4, 6))
+
+    diagnostics_button = tk.Button(
+        settings_frame,
+        text="ДИАГНОСТИКА ИСТОЧНИКА 1 СЕК",
+        bg="#222",
+        fg="#fff",
+        activebackground="#444",
+        activeforeground="#fff",
+        command=run_audio_diagnostics
+    )
+    diagnostics_button.pack(fill="x", pady=(0, 6))
 
     tk.Checkbutton(
         settings_frame, text="Показывать подписи направлений", variable=labels_var,
@@ -417,7 +560,8 @@ def show_launcher():
         settings["sensitivity"] = float(sensitivity_var.get())
         settings["size"] = int(size_var.get())
         settings["opacity"] = float(opacity_var.get())
-        settings["color_profile"] = profile_var.get()
+        settings["profile_name"] = preset_var.get()
+        settings["color_profile"] = color_profile_var.get()
         settings["show_labels"] = bool(labels_var.get())
         settings["swap_channels"] = bool(swap_channels_var.get())
         settings["sector_spread"] = int(sector_spread_var.get())
@@ -563,6 +707,12 @@ class RadarOverlay:
         self.menu = tk.Menu(root, tearoff=0, bg="#151515", fg="#eeeeee", activebackground="#333333")
         self.menu.add_command(label="Скрыть / показать подписи", command=self.toggle_labels)
         self.menu.add_command(label="Переключить HUD", command=self.toggle_visual_mode)
+        test_menu = tk.Menu(self.menu, tearoff=0, bg="#151515", fg="#eeeeee", activebackground="#333333")
+        test_menu.add_command(label="Вперед", command=lambda: self.test_direction(0))
+        test_menu.add_command(label="Вправо", command=lambda: self.test_direction(90))
+        test_menu.add_command(label="Назад", command=lambda: self.test_direction(180))
+        test_menu.add_command(label="Влево", command=lambda: self.test_direction(270))
+        self.menu.add_cascade(label="Тест направлений", menu=test_menu)
         self.menu.add_command(label="Закрыть радар", command=self.close)
         self.init_graphics()
         self.update_gui()
@@ -613,6 +763,15 @@ class RadarOverlay:
         settings["visual_mode"] = "minimal" if settings["visual_mode"] == "radar" else "radar"
         self.init_graphics()
         self.save_layout_throttled(force=True)
+
+    def test_direction(self, angle):
+        global sector_data, current_peak, current_confidence, is_human
+        test = build_sector_levels(angle, 1.0, spread=settings.get("sector_spread", 2))
+        for i in range(16):
+            sector_data[i] = max(sector_data[i], test[i])
+        current_peak = 1.0
+        current_confidence = 1.0
+        is_human = True
 
     def save_layout_throttled(self, force=False):
         now = time.time()
