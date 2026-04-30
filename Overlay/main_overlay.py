@@ -84,6 +84,10 @@ settings = {
     "show_labels": True,
     "swap_channels": False,
     "sector_spread": 2,
+    "noise_floor": NOISE_FLOOR,
+    "visual_mode": "radar",
+    "overlay_x": 100,
+    "overlay_y": 100,
 }
 
 # Глобальные переменные
@@ -95,6 +99,7 @@ target_window_title = ""
 selected_speaker_id = None 
 selected_audio_source = None
 current_peak = 0.0
+current_confidence = 0.0
 
 # --- CTYPES ---
 user32 = ctypes.windll.user32
@@ -164,6 +169,13 @@ def load_config():
         log_message(f"Config read error: {e}")
         return {}
 
+def save_config(config):
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log_message(f"Config write error: {e}")
+
 def clamp(value, min_value, max_value):
     return max(min_value, min(max_value, value))
 
@@ -175,12 +187,54 @@ def apply_saved_settings(saved_config):
     settings["show_labels"] = bool(saved_config.get("show_labels", settings["show_labels"]))
     settings["swap_channels"] = bool(saved_config.get("swap_channels", settings["swap_channels"]))
     settings["sector_spread"] = int(saved_config.get("sector_spread", settings["sector_spread"]))
+    settings["noise_floor"] = float(saved_config.get("noise_floor", settings["noise_floor"]))
+    settings["visual_mode"] = saved_config.get("visual_mode", settings["visual_mode"])
+    settings["overlay_x"] = int(saved_config.get("overlay_x", settings["overlay_x"]))
+    settings["overlay_y"] = int(saved_config.get("overlay_y", settings["overlay_y"]))
     settings["sensitivity"] = clamp(settings["sensitivity"], 80.0, 900.0)
     settings["size"] = int(clamp(settings["size"], 180, 800))
     settings["opacity"] = clamp(settings["opacity"], 0.35, 1.0)
     settings["sector_spread"] = int(clamp(settings["sector_spread"], 1, 3))
+    settings["noise_floor"] = clamp(settings["noise_floor"], 0.002, 0.25)
+    settings["overlay_x"] = int(clamp(settings["overlay_x"], -4000, 4000))
+    settings["overlay_y"] = int(clamp(settings["overlay_y"], -4000, 4000))
+    if settings["visual_mode"] not in ("radar", "minimal"):
+        settings["visual_mode"] = "radar"
     if settings["color_profile"] not in COLOR_PROFILES:
         settings["color_profile"] = "orange"
+
+def build_saved_config(window, audio_source):
+    return {
+        "window": window,
+        "audio": audio_source.get("name") if audio_source else selected_speaker_id,
+        "audio_kind": audio_source.get("kind") if audio_source else "loopback",
+        "sensitivity": settings["sensitivity"],
+        "size": settings["size"],
+        "opacity": settings["opacity"],
+        "color_profile": settings["color_profile"],
+        "show_labels": settings["show_labels"],
+        "swap_channels": settings["swap_channels"],
+        "sector_spread": settings["sector_spread"],
+        "noise_floor": settings["noise_floor"],
+        "visual_mode": settings["visual_mode"],
+        "overlay_x": settings["overlay_x"],
+        "overlay_y": settings["overlay_y"],
+    }
+
+def measure_noise_floor(source, sensitivity, seconds=3.0):
+    levels = []
+    frames = max(1, int(seconds * SAMPLE_RATE / BLOCK_SIZE))
+    with open_audio_recorder_source(source).recorder(samplerate=SAMPLE_RATE, channels=2, blocksize=BLOCK_SIZE) as recorder:
+        for _ in range(frames):
+            data = recorder.record(numframes=BLOCK_SIZE)
+            channel_sum = math.sqrt(float(np.mean(data[:, 0] ** 2))) + math.sqrt(float(np.mean(data[:, 1] ** 2)))
+            levels.append(float(np.power(channel_sum * sensitivity, COMPRESSION)))
+
+    if not levels:
+        return NOISE_FLOOR
+
+    percentile = float(np.percentile(levels, 90))
+    return clamp(percentile * 1.7, 0.006, 0.25)
 
 def show_launcher():
     global target_window_title, selected_speaker_id, selected_audio_source
@@ -190,7 +244,7 @@ def show_launcher():
 
     root = tk.Tk()
     root.title("Razgrom Config")
-    root.geometry("500x690")
+    root.geometry("520x760")
     root.minsize(500, 560)
     root.resizable(True, True)
     root.configure(bg="#111")
@@ -248,6 +302,8 @@ def show_launcher():
     labels_var = tk.BooleanVar(value=settings["show_labels"])
     swap_channels_var = tk.BooleanVar(value=settings["swap_channels"])
     sector_spread_var = tk.IntVar(value=settings["sector_spread"])
+    noise_floor_var = tk.DoubleVar(value=settings["noise_floor"])
+    visual_mode_var = tk.StringVar(value=settings["visual_mode"])
     profile_var = tk.StringVar(value=settings["color_profile"])
 
     def add_scale(label, variable, from_, to_, resolution=1):
@@ -265,6 +321,7 @@ def show_launcher():
     add_scale("Размер радара", size_var, 180, 700, 10)
     add_scale("Непрозрачность", opacity_var, 0.35, 1.0, 0.05)
     add_scale("Ширина сектора", sector_spread_var, 1, 3, 1)
+    add_scale("Порог шума", noise_floor_var, 0.002, 0.25, 0.002)
 
     profile_row = tk.Frame(settings_frame, bg="#111")
     profile_row.pack(fill="x", pady=6)
@@ -279,6 +336,58 @@ def show_launcher():
         profile_hint.config(text=COLOR_PROFILES.get(profile_var.get(), COLOR_PROFILES["orange"])["name"])
 
     profile_combo.bind("<<ComboboxSelected>>", update_profile_hint)
+
+    mode_row = tk.Frame(settings_frame, bg="#111")
+    mode_row.pack(fill="x", pady=6)
+    tk.Label(mode_row, text="Режим HUD", bg="#111", fg="#ddd", width=15, anchor="w").pack(side="left")
+    mode_combo = ttk.Combobox(mode_row, textvariable=visual_mode_var, state="readonly", width=22)
+    mode_combo["values"] = ("radar", "minimal")
+    mode_combo.pack(side="left")
+
+    calibration_row = tk.Frame(settings_frame, bg="#111")
+    calibration_row.pack(fill="x", pady=(6, 2))
+    calibration_status = tk.Label(calibration_row, text="Калибровка тишины: готово", bg="#111", fg="#aaa", anchor="w")
+    calibration_status.pack(side="left", fill="x", expand=True)
+
+    def selected_source_from_list():
+        try:
+            return audio_sources[list_aud.curselection()[0]]
+        except:
+            return None
+
+    def run_noise_calibration():
+        source = selected_source_from_list()
+        calibration_status.config(text="Калибровка тишины: слушаю 3 секунды...", fg="#ffcc66")
+        calibrate_button.config(state="disabled")
+
+        def worker():
+            try:
+                measured = measure_noise_floor(source, float(sensitivity_var.get()), seconds=3.0)
+                root.after(0, lambda: finish_calibration(measured, None))
+            except Exception as e:
+                error_text = str(e)
+                root.after(0, lambda: finish_calibration(None, error_text))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_calibration(value, error):
+        calibrate_button.config(state="normal")
+        if error:
+            calibration_status.config(text=f"Калибровка не удалась: {error}", fg="#ff6666")
+            return
+        noise_floor_var.set(round(value, 3))
+        calibration_status.config(text=f"Порог шума установлен: {value:.3f}", fg="#66ff99")
+
+    calibrate_button = tk.Button(
+        settings_frame,
+        text="КАЛИБРОВАТЬ ТИШИНУ 3 СЕК",
+        bg="#333",
+        fg="#fff",
+        activebackground="#444",
+        activeforeground="#fff",
+        command=run_noise_calibration
+    )
+    calibrate_button.pack(fill="x", pady=(4, 6))
 
     tk.Checkbutton(
         settings_frame, text="Показывать подписи направлений", variable=labels_var,
@@ -312,25 +421,10 @@ def show_launcher():
         settings["show_labels"] = bool(labels_var.get())
         settings["swap_channels"] = bool(swap_channels_var.get())
         settings["sector_spread"] = int(sector_spread_var.get())
+        settings["noise_floor"] = float(noise_floor_var.get())
+        settings["visual_mode"] = visual_mode_var.get()
         
-        # Сохраняем конфиг
-        new_config = {
-            "window": target_window_title,
-            "audio": selected_speaker_id,
-            "audio_kind": selected_audio_source.get("kind") if selected_audio_source else "loopback",
-            "sensitivity": settings["sensitivity"],
-            "size": settings["size"],
-            "opacity": settings["opacity"],
-            "color_profile": settings["color_profile"],
-            "show_labels": settings["show_labels"],
-            "swap_channels": settings["swap_channels"],
-            "sector_spread": settings["sector_spread"],
-        }
-        try:
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(new_config, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            log_message(f"Config write error: {e}")
+        save_config(build_saved_config(target_window_title, selected_audio_source))
         
         root.destroy()
 
@@ -357,7 +451,7 @@ def show_launcher():
 
 # --- АУДИО ДВИЖОК ---
 def audio_loop():
-    global sector_data, is_moving, is_human, running, current_peak
+    global sector_data, is_moving, is_human, running, current_peak, current_confidence
     
     try: np.fromstring(b'\x00'*4, dtype=np.float32)
     except:
@@ -411,6 +505,7 @@ def audio_loop():
                 total *= 0.45
 
             current_peak = min(total, 1.0)
+            current_confidence = clamp((abs(balance) * 0.45) + (current_peak * 0.55), 0.0, 1.0)
             
             is_back = False
             if total > 0.05:
@@ -420,7 +515,7 @@ def audio_loop():
                     centroid = (np.sum(np.arange(len(mags)) * mags) / np.sum(mags)) * (SAMPLE_RATE / BLOCK_SIZE)
                     if centroid < REAR_THRESHOLD: is_back = True
 
-            if total > NOISE_FLOOR:
+            if total > settings.get("noise_floor", NOISE_FLOOR):
                 angle = direction_angle_from_balance(
                     balance,
                     is_back=is_back,
@@ -442,7 +537,7 @@ class RadarOverlay:
         self.root.overrideredirect(True)
         self.width = settings["size"]
         self.height = settings["size"]
-        self.root.geometry(f"{self.width}x{self.height}+100+100")
+        self.root.geometry(f"{self.width}x{self.height}+{settings['overlay_x']}+{settings['overlay_y']}")
         self.root.wm_attributes("-topmost", True)
         self.root.wm_attributes("-transparentcolor", TRANS_COLOR)
         try:
@@ -463,8 +558,11 @@ class RadarOverlay:
         self.profile = COLOR_PROFILES.get(settings["color_profile"], COLOR_PROFILES["orange"])
         self.status_text = None
         self.peak_bar = None
+        self.confidence_text = None
+        self.last_config_save = 0
         self.menu = tk.Menu(root, tearoff=0, bg="#151515", fg="#eeeeee", activebackground="#333333")
         self.menu.add_command(label="Скрыть / показать подписи", command=self.toggle_labels)
+        self.menu.add_command(label="Переключить HUD", command=self.toggle_visual_mode)
         self.menu.add_command(label="Закрыть радар", command=self.close)
         self.init_graphics()
         self.update_gui()
@@ -477,6 +575,9 @@ class RadarOverlay:
         x = self.root.winfo_x() + (event.x - self.start_x)
         y = self.root.winfo_y() + (event.y - self.start_y)
         self.root.geometry(f"+{x}+{y}")
+        settings["overlay_x"] = x
+        settings["overlay_y"] = y
+        self.save_layout_throttled()
 
     def start_resize(self, event):
         self.start_x = event.x
@@ -491,9 +592,11 @@ class RadarOverlay:
         self.height = new_size
         self.root.geometry(f"{int(new_size)}x{int(new_size)}")
         self.canvas.config(width=new_size, height=new_size)
+        settings["size"] = int(new_size)
         self.init_graphics()
         self.start_x = event.x
         self.start_y = event.y
+        self.save_layout_throttled(force=True)
 
     def show_context_menu(self, event):
         try:
@@ -504,10 +607,34 @@ class RadarOverlay:
     def toggle_labels(self):
         settings["show_labels"] = not settings["show_labels"]
         self.init_graphics()
+        self.save_layout_throttled(force=True)
+
+    def toggle_visual_mode(self):
+        settings["visual_mode"] = "minimal" if settings["visual_mode"] == "radar" else "radar"
+        self.init_graphics()
+        self.save_layout_throttled(force=True)
+
+    def save_layout_throttled(self, force=False):
+        now = time.time()
+        if not force and (now - self.last_config_save) < 0.7:
+            return
+        self.last_config_save = now
+        saved = load_config()
+        saved.update({
+            "size": int(settings["size"]),
+            "overlay_x": int(settings["overlay_x"]),
+            "overlay_y": int(settings["overlay_y"]),
+            "show_labels": settings["show_labels"],
+            "visual_mode": settings["visual_mode"],
+        })
+        save_config(saved)
 
     def close(self):
         global running
         running = False
+        settings["overlay_x"] = self.root.winfo_x()
+        settings["overlay_y"] = self.root.winfo_y()
+        self.save_layout_throttled(force=True)
         self.root.destroy()
 
     def draw_block(self, cx, cy, r_in, r_out, start_deg, end_deg):
@@ -533,13 +660,15 @@ class RadarOverlay:
         grid_color = self.profile["grid"]
         active_color = self.profile["active"]
         text_color = self.profile["text"]
-        self.canvas.create_oval(cx-radius, cy-radius, cx+radius, cy+radius, fill=TRANS_COLOR, outline=grid_color, width=2)
-        self.canvas.create_oval(cx-radius*0.7, cy-radius*0.7, cx+radius*0.7, cy+radius*0.7, outline=grid_color, width=1)
-        self.canvas.create_oval(cx-radius*0.4, cy-radius*0.4, cx+radius*0.4, cy+radius*0.4, outline=grid_color, width=1)
+        minimal = settings["visual_mode"] == "minimal"
+        if not minimal:
+            self.canvas.create_oval(cx-radius, cy-radius, cx+radius, cy+radius, fill=TRANS_COLOR, outline=grid_color, width=2)
+            self.canvas.create_oval(cx-radius*0.7, cy-radius*0.7, cx+radius*0.7, cy+radius*0.7, outline=grid_color, width=1)
+            self.canvas.create_oval(cx-radius*0.4, cy-radius*0.4, cx+radius*0.4, cy+radius*0.4, outline=grid_color, width=1)
         
         num_sectors = 16
-        blocks_per_sector = 10
-        inner_gap = radius * 0.15
+        blocks_per_sector = 6 if minimal else 10
+        inner_gap = radius * 0.52 if minimal else radius * 0.15
         block_depth = (radius - inner_gap) / blocks_per_sector
         sector_angle = 360 / 16
         
@@ -555,7 +684,7 @@ class RadarOverlay:
                 blocks.append(poly)
             self.blocks_gfx.append(blocks)
             
-        font_size = int(radius / 5)
+        font_size = int(radius / 6) if minimal else int(radius / 5)
         self.center_icon = self.canvas.create_text(cx, cy, text="▲", fill=active_color, font=("Arial", font_size))
 
         if settings["show_labels"]:
@@ -570,8 +699,9 @@ class RadarOverlay:
             for text, dx, dy in labels:
                 self.canvas.create_text(cx + dx, cy + dy, text=text, fill=text_color, font=label_font)
 
-        status_font = ("Consolas", max(int(radius / 16), 9), "bold")
+        status_font = ("Consolas", max(int(radius / 15), 9), "bold")
         self.status_text = self.canvas.create_text(cx, cy + radius * 0.34, text="IDLE", fill=text_color, font=status_font)
+        self.confidence_text = self.canvas.create_text(cx, cy + radius * 0.23, text="CONF 0%", fill=text_color, font=("Consolas", max(int(radius / 20), 8), "bold"))
         bar_w = radius * 0.65
         bar_y = cy + radius * 0.48
         self.canvas.create_rectangle(cx - bar_w / 2, bar_y, cx + bar_w / 2, bar_y + 4, outline=grid_color, fill=TRANS_COLOR)
@@ -588,16 +718,17 @@ class RadarOverlay:
         self.canvas.tag_bind(self.resize_grip, '<Leave>', lambda e: self.root.config(cursor="arrow"))
 
     def update_gui(self):
-        global sector_data, is_moving, is_human, current_peak
+        global sector_data, is_moving, is_human, current_peak, current_confidence
         decay = 0.08
         active_color = self.profile["active"]
         danger_color = self.profile["danger"]
         muted_color = self.profile["muted"]
         text_color = self.profile["text"]
+        blocks_per_sector = 6 if settings["visual_mode"] == "minimal" else 10
         for s in range(16):
             level = sector_data[s]
-            active = int(math.ceil(level * 10))
-            for b in range(10):
+            active = int(math.ceil(level * blocks_per_sector))
+            for b in range(blocks_per_sector):
                 poly = self.blocks_gfx[s][b]
                 if b < active:
                     col = danger_color if level > 0.8 else active_color
@@ -623,6 +754,9 @@ class RadarOverlay:
         self.canvas.itemconfigure(self.center_icon, fill=icon_color)
         if self.status_text:
             self.canvas.itemconfigure(self.status_text, text=status, fill=danger_color if is_human else text_color)
+        if self.confidence_text:
+            conf = int(clamp(current_confidence, 0.0, 1.0) * 100)
+            self.canvas.itemconfigure(self.confidence_text, text=f"CONF {conf}%", fill=danger_color if conf > 80 else text_color)
         if self.peak_bar:
             cx = self.width / 2
             radius = min(self.width, self.height) / 2 - 10
@@ -632,6 +766,7 @@ class RadarOverlay:
             self.canvas.coords(self.peak_bar, cx - bar_w / 2, bar_y, cx - bar_w / 2 + bar_w * peak, bar_y + 4)
             self.canvas.itemconfigure(self.peak_bar, fill=danger_color if peak > 0.8 else active_color)
             current_peak *= 0.92
+            current_confidence *= 0.94
         self.root.after(20, self.update_gui)
 
 if __name__ == "__main__":
