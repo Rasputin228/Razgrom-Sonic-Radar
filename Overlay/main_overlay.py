@@ -9,6 +9,7 @@ import os
 import json
 
 from audio_direction import build_sector_levels, direction_angle_from_balance
+from audio_events import classify_audio_event
 
 # --- ЛОГГЕР ---
 def log_message(msg):
@@ -137,6 +138,8 @@ selected_speaker_id = None
 selected_audio_source = None
 current_peak = 0.0
 current_confidence = 0.0
+current_event = "IDLE"
+previous_level = 0.0
 
 # --- CTYPES ---
 user32 = ctypes.windll.user32
@@ -595,7 +598,7 @@ def show_launcher():
 
 # --- АУДИО ДВИЖОК ---
 def audio_loop():
-    global sector_data, is_moving, is_human, running, current_peak, current_confidence
+    global sector_data, is_moving, is_human, running, current_peak, current_confidence, current_event, previous_level
     
     try: np.fromstring(b'\x00'*4, dtype=np.float32)
     except:
@@ -624,6 +627,9 @@ def audio_loop():
                     if target_window_title not in buff.value and "Razgrom" not in buff.value and buff.value != "":
                         sector_data = [0.0] * 16
                         current_peak = 0.0
+                        current_confidence = 0.0
+                        current_event = "IDLE"
+                        previous_level = 0.0
                         time.sleep(0.2)
                         continue
                 except: pass
@@ -652,6 +658,7 @@ def audio_loop():
             current_confidence = clamp((abs(balance) * 0.45) + (current_peak * 0.55), 0.0, 1.0)
             
             is_back = False
+            centroid = 0.0
             if total > 0.05:
                 freqs = np.fft.rfft(data[:, 0] + data[:, 1])
                 mags = np.abs(freqs)
@@ -659,7 +666,11 @@ def audio_loop():
                     centroid = (np.sum(np.arange(len(mags)) * mags) / np.sum(mags)) * (SAMPLE_RATE / BLOCK_SIZE)
                     if centroid < REAR_THRESHOLD: is_back = True
 
-            if total > settings.get("noise_floor", NOISE_FLOOR):
+            noise_floor = settings.get("noise_floor", NOISE_FLOOR)
+            current_event = classify_audio_event(total, previous_level, centroid, noise_floor, is_moving=is_moving)
+            previous_level = (previous_level * 0.72) + (total * 0.28)
+
+            if total > noise_floor:
                 angle = direction_angle_from_balance(
                     balance,
                     is_back=is_back,
@@ -701,6 +712,7 @@ class RadarOverlay:
         self.blocks_gfx = [] 
         self.profile = COLOR_PROFILES.get(settings["color_profile"], COLOR_PROFILES["orange"])
         self.status_text = None
+        self.event_text = None
         self.peak_bar = None
         self.confidence_text = None
         self.last_config_save = 0
@@ -861,6 +873,7 @@ class RadarOverlay:
         status_font = ("Consolas", max(int(radius / 15), 9), "bold")
         self.status_text = self.canvas.create_text(cx, cy + radius * 0.34, text="IDLE", fill=text_color, font=status_font)
         self.confidence_text = self.canvas.create_text(cx, cy + radius * 0.23, text="CONF 0%", fill=text_color, font=("Consolas", max(int(radius / 20), 8), "bold"))
+        self.event_text = self.canvas.create_text(cx, cy - radius * 0.29, text="EVENT IDLE", fill=text_color, font=("Consolas", max(int(radius / 18), 8), "bold"))
         bar_w = radius * 0.65
         bar_y = cy + radius * 0.48
         self.canvas.create_rectangle(cx - bar_w / 2, bar_y, cx + bar_w / 2, bar_y + 4, outline=grid_color, fill=TRANS_COLOR)
@@ -877,7 +890,7 @@ class RadarOverlay:
         self.canvas.tag_bind(self.resize_grip, '<Leave>', lambda e: self.root.config(cursor="arrow"))
 
     def update_gui(self):
-        global sector_data, is_moving, is_human, current_peak, current_confidence
+        global sector_data, is_moving, is_human, current_peak, current_confidence, current_event
         decay = 0.08
         active_color = self.profile["active"]
         danger_color = self.profile["danger"]
@@ -890,7 +903,10 @@ class RadarOverlay:
             for b in range(blocks_per_sector):
                 poly = self.blocks_gfx[s][b]
                 if b < active:
-                    col = danger_color if level > 0.8 else active_color
+                    if current_event in ("IMPACT", "SHARP") and level > 0.65:
+                        col = danger_color
+                    else:
+                        col = active_color
                     self.canvas.itemconfigure(poly, fill=col)
                 else:
                     self.canvas.itemconfigure(poly, fill=TRANS_COLOR)
@@ -916,6 +932,9 @@ class RadarOverlay:
         if self.confidence_text:
             conf = int(clamp(current_confidence, 0.0, 1.0) * 100)
             self.canvas.itemconfigure(self.confidence_text, text=f"CONF {conf}%", fill=danger_color if conf > 80 else text_color)
+        if self.event_text:
+            event_color = danger_color if current_event in ("IMPACT", "SHARP") else text_color
+            self.canvas.itemconfigure(self.event_text, text=f"EVENT {current_event}", fill=event_color)
         if self.peak_bar:
             cx = self.width / 2
             radius = min(self.width, self.height) / 2 - 10
