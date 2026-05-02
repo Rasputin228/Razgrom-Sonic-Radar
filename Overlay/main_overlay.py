@@ -8,7 +8,7 @@ from ctypes import wintypes
 import os
 import json
 
-from audio_direction import build_sector_levels, direction_angle_from_balance
+from audio_direction import build_sector_levels, direction_angle_from_balance, smooth_angle
 from audio_events import classify_audio_event
 
 # --- ЛОГГЕР ---
@@ -126,6 +126,7 @@ settings = {
     "noise_floor": NOISE_FLOOR,
     "visual_mode": "radar",
     "edge_indicators": True,
+    "direction_smoothing": 0.35,
     "overlay_x": 100,
     "overlay_y": 100,
 }
@@ -144,6 +145,7 @@ current_event = "IDLE"
 previous_level = 0.0
 audio_status = "IDLE"
 audio_error_message = ""
+smoothed_direction_angle = None
 
 # --- CTYPES ---
 user32 = ctypes.windll.user32
@@ -235,6 +237,7 @@ def apply_saved_settings(saved_config):
     settings["noise_floor"] = float(saved_config.get("noise_floor", settings["noise_floor"]))
     settings["visual_mode"] = saved_config.get("visual_mode", settings["visual_mode"])
     settings["edge_indicators"] = bool(saved_config.get("edge_indicators", settings["edge_indicators"]))
+    settings["direction_smoothing"] = float(saved_config.get("direction_smoothing", settings["direction_smoothing"]))
     settings["overlay_x"] = int(saved_config.get("overlay_x", settings["overlay_x"]))
     settings["overlay_y"] = int(saved_config.get("overlay_y", settings["overlay_y"]))
     settings["sensitivity"] = clamp(settings["sensitivity"], 80.0, 900.0)
@@ -242,6 +245,7 @@ def apply_saved_settings(saved_config):
     settings["opacity"] = clamp(settings["opacity"], 0.35, 1.0)
     settings["sector_spread"] = int(clamp(settings["sector_spread"], 1, 3))
     settings["noise_floor"] = clamp(settings["noise_floor"], 0.002, 0.25)
+    settings["direction_smoothing"] = clamp(settings["direction_smoothing"], 0.05, 1.0)
     settings["overlay_x"] = int(clamp(settings["overlay_x"], -4000, 4000))
     settings["overlay_y"] = int(clamp(settings["overlay_y"], -4000, 4000))
     if settings["visual_mode"] not in ("radar", "minimal"):
@@ -267,6 +271,7 @@ def build_saved_config(window, audio_source):
         "noise_floor": settings["noise_floor"],
         "visual_mode": settings["visual_mode"],
         "edge_indicators": settings["edge_indicators"],
+        "direction_smoothing": settings["direction_smoothing"],
         "overlay_x": settings["overlay_x"],
         "overlay_y": settings["overlay_y"],
     }
@@ -411,6 +416,7 @@ def show_launcher():
     color_profile_var = tk.StringVar(value=settings["color_profile"])
     preset_var = tk.StringVar(value=settings["profile_name"])
     edge_indicators_var = tk.BooleanVar(value=settings["edge_indicators"])
+    direction_smoothing_var = tk.DoubleVar(value=settings["direction_smoothing"])
 
     preset_row = tk.Frame(settings_frame, bg="#111")
     preset_row.pack(fill="x", pady=(0, 6))
@@ -449,6 +455,7 @@ def show_launcher():
     add_scale("Непрозрачность", opacity_var, 0.35, 1.0, 0.05)
     add_scale("Ширина сектора", sector_spread_var, 1, 3, 1)
     add_scale("Порог шума", noise_floor_var, 0.002, 0.25, 0.002)
+    add_scale("Сглаживание", direction_smoothing_var, 0.05, 1.0, 0.05)
 
     profile_row = tk.Frame(settings_frame, bg="#111")
     profile_row.pack(fill="x", pady=6)
@@ -623,6 +630,7 @@ def show_launcher():
         settings["noise_floor"] = float(noise_floor_var.get())
         settings["visual_mode"] = visual_mode_var.get()
         settings["edge_indicators"] = bool(edge_indicators_var.get())
+        settings["direction_smoothing"] = float(direction_smoothing_var.get())
         
         save_config(build_saved_config(target_window_title, selected_audio_source))
         
@@ -651,7 +659,7 @@ def show_launcher():
 
 # --- АУДИО ДВИЖОК ---
 def audio_loop():
-    global sector_data, is_moving, is_human, running, current_peak, current_confidence, current_event, previous_level, audio_status, audio_error_message
+    global sector_data, is_moving, is_human, running, current_peak, current_confidence, current_event, previous_level, audio_status, audio_error_message, smoothed_direction_angle
     
     try: np.fromstring(b'\x00'*4, dtype=np.float32)
     except:
@@ -684,6 +692,7 @@ def audio_loop():
                                 current_confidence = 0.0
                                 current_event = "IDLE"
                                 previous_level = 0.0
+                                smoothed_direction_angle = None
                                 time.sleep(0.2)
                                 continue
                         except: pass
@@ -730,8 +739,12 @@ def audio_loop():
                             is_back=is_back,
                             swap_channels=settings.get("swap_channels", False)
                         )
+                        smoothing = settings.get("direction_smoothing", 0.35)
+                        if current_event in ("IMPACT", "SHARP"):
+                            smoothing = max(smoothing, 0.75)
+                        smoothed_direction_angle = smooth_angle(smoothed_direction_angle, angle, smoothing)
                         val = min(total, 1.0)
-                        target = build_sector_levels(angle, val, spread=settings.get("sector_spread", 2))
+                        target = build_sector_levels(smoothed_direction_angle, val, spread=settings.get("sector_spread", 2))
 
                         for i in range(16):
                             if target[i] > sector_data[i]: sector_data[i] = target[i]
@@ -743,6 +756,7 @@ def audio_loop():
             current_event = "AUDIO ERROR"
             current_peak = 0.0
             current_confidence = 0.0
+            smoothed_direction_angle = None
             sector_data = [0.0] * 16
             log_message(f"Audio loop error: {e}")
             time.sleep(2)

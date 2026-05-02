@@ -28,6 +28,19 @@ def direction_angle_from_balance(balance, is_back=False, swap_channels=False):
     return normalize_angle(pan_angle)
 
 
+def angular_difference(target_degrees, source_degrees):
+    return ((target_degrees - source_degrees + 180) % 360) - 180
+
+
+def smooth_angle(previous_degrees, target_degrees, strength):
+    if previous_degrees is None:
+        return normalize_angle(target_degrees)
+
+    normalized_strength = clamp(strength, 0.0, 1.0)
+    delta = angular_difference(target_degrees, previous_degrees)
+    return normalize_angle(previous_degrees + delta * normalized_strength)
+
+
 def build_sector_levels(angle_degrees, level, spread=2):
     center = angle_to_sector(angle_degrees)
     peak = clamp(level, 0.0, 1.0)

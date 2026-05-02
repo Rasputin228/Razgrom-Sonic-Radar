@@ -1,9 +1,11 @@
 import unittest
 
 from Overlay.audio_direction import (
+    angular_difference,
     angle_to_sector,
     build_sector_levels,
     direction_angle_from_balance,
+    smooth_angle,
 )
 
 
@@ -37,6 +39,14 @@ class AudioDirectionTests(unittest.TestCase):
         self.assertEqual(sectors[5], 0.5)
         self.assertEqual(sectors[2], 0.25)
         self.assertEqual(sectors[6], 0.25)
+
+    def test_angular_difference_wraps_short_way(self):
+        self.assertEqual(angular_difference(10, 350), 20)
+        self.assertEqual(angular_difference(350, 10), -20)
+
+    def test_smooth_angle_crosses_zero_without_spinning(self):
+        self.assertEqual(round(smooth_angle(350, 10, 0.5)), 0)
+        self.assertEqual(round(smooth_angle(10, 350, 0.5)), 0)
 
 
 if __name__ == "__main__":
