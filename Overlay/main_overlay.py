@@ -43,6 +43,7 @@ COMPRESSION = 0.4
 REAR_THRESHOLD = 1200
 NOISE_FLOOR = 0.018
 CONFIG_FILE = "config.json"
+DIAGNOSTIC_REPORT_FILE = "diagnostic_report.json"
 
 # ЦВЕТА
 TRANS_COLOR = "#000001"
@@ -140,6 +141,8 @@ current_peak = 0.0
 current_confidence = 0.0
 current_event = "IDLE"
 previous_level = 0.0
+audio_status = "IDLE"
+audio_error_message = ""
 
 # --- CTYPES ---
 user32 = ctypes.windll.user32
@@ -319,6 +322,21 @@ def diagnose_audio_source(source, sensitivity, seconds=1.0):
         "frames": len(levels),
     }
 
+def write_diagnostic_report(window, audio_source, last_report=None):
+    report = {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "selected_window": window,
+        "selected_audio_source": audio_source,
+        "settings": settings.copy(),
+        "audio_status": audio_status,
+        "audio_error": audio_error_message,
+        "last_measurement": last_report,
+        "available_audio_sources": get_audio_sources(),
+    }
+    with open(DIAGNOSTIC_REPORT_FILE, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    return os.path.abspath(DIAGNOSTIC_REPORT_FILE)
+
 def show_launcher():
     global target_window_title, selected_speaker_id, selected_audio_source
     
@@ -453,6 +471,7 @@ def show_launcher():
     calibration_row.pack(fill="x", pady=(6, 2))
     calibration_status = tk.Label(calibration_row, text="Калибровка тишины: готово", bg="#111", fg="#aaa", anchor="w")
     calibration_status.pack(side="left", fill="x", expand=True)
+    last_diagnostic_report = {"data": None}
 
     def selected_source_from_list():
         try:
@@ -512,6 +531,7 @@ def show_launcher():
             text=f"AVG {report['level']:.3f} | PEAK {report['peak']:.3f} | {side} | {report['centroid']:.0f} Hz",
             fg="#66ff99"
         )
+        last_diagnostic_report["data"] = report
 
     calibrate_button = tk.Button(
         settings_frame,
@@ -534,6 +554,29 @@ def show_launcher():
         command=run_audio_diagnostics
     )
     diagnostics_button.pack(fill="x", pady=(0, 6))
+
+    def export_diagnostic_report():
+        try:
+            window = list_win.get(list_win.curselection())
+        except:
+            window = ""
+        source = selected_source_from_list()
+        try:
+            path = write_diagnostic_report(window, source, last_diagnostic_report["data"])
+            calibration_status.config(text=f"Отчет сохранен: {path}", fg="#66ff99")
+        except Exception as e:
+            calibration_status.config(text=f"Отчет не сохранен: {e}", fg="#ff6666")
+
+    report_button = tk.Button(
+        settings_frame,
+        text="СОХРАНИТЬ ДИАГНОСТИЧЕСКИЙ ОТЧЕТ",
+        bg="#222",
+        fg="#fff",
+        activebackground="#444",
+        activeforeground="#fff",
+        command=export_diagnostic_report
+    )
+    report_button.pack(fill="x", pady=(0, 6))
 
     tk.Checkbutton(
         settings_frame, text="Показывать подписи направлений", variable=labels_var,
@@ -598,7 +641,7 @@ def show_launcher():
 
 # --- АУДИО ДВИЖОК ---
 def audio_loop():
-    global sector_data, is_moving, is_human, running, current_peak, current_confidence, current_event, previous_level
+    global sector_data, is_moving, is_human, running, current_peak, current_confidence, current_event, previous_level, audio_status, audio_error_message
     
     try: np.fromstring(b'\x00'*4, dtype=np.float32)
     except:
@@ -610,79 +653,89 @@ def audio_loop():
     try: b, a = signal.butter(4, [FREQ_LOW, FREQ_HIGH], btype='band', fs=SAMPLE_RATE)
     except: return
 
-    mic = None
-    try:
-        mic = open_audio_recorder_source(selected_audio_source)
-    except: mic = sc.default_microphone()
+    while running:
+        try:
+            mic = open_audio_recorder_source(selected_audio_source)
+            audio_status = "RUNNING"
+            audio_error_message = ""
 
-    with mic.recorder(samplerate=SAMPLE_RATE, channels=2, blocksize=BLOCK_SIZE) as recorder:
-        while running:
-            data = recorder.record(numframes=BLOCK_SIZE)
+            with mic.recorder(samplerate=SAMPLE_RATE, channels=2, blocksize=BLOCK_SIZE) as recorder:
+                while running:
+                    data = recorder.record(numframes=BLOCK_SIZE)
             
-            if target_window_title:
-                try:
-                    hwnd = user32.GetForegroundWindow()
-                    buff = ctypes.create_unicode_buffer(255)
-                    user32.GetWindowTextW(hwnd, buff, 255)
-                    if target_window_title not in buff.value and "Razgrom" not in buff.value and buff.value != "":
-                        sector_data = [0.0] * 16
-                        current_peak = 0.0
-                        current_confidence = 0.0
-                        current_event = "IDLE"
-                        previous_level = 0.0
-                        time.sleep(0.2)
-                        continue
-                except: pass
+                    if target_window_title:
+                        try:
+                            hwnd = user32.GetForegroundWindow()
+                            buff = ctypes.create_unicode_buffer(255)
+                            user32.GetWindowTextW(hwnd, buff, 255)
+                            if target_window_title not in buff.value and "Razgrom" not in buff.value and buff.value != "":
+                                sector_data = [0.0] * 16
+                                current_peak = 0.0
+                                current_confidence = 0.0
+                                current_event = "IDLE"
+                                previous_level = 0.0
+                                time.sleep(0.2)
+                                continue
+                        except: pass
 
-            is_moving = False
-            try:
-                is_moving = any(is_key_down(key) for key in MOVE_KEYS)
-            except: pass
+                    is_moving = False
+                    try:
+                        is_moving = any(is_key_down(key) for key in MOVE_KEYS)
+                    except: pass
 
-            filtered = signal.lfilter(b, a, data, axis=0)
-            raw_l = filtered[:, 0]
-            raw_r = filtered[:, 1]
-            
-            rms_l = math.sqrt(float(np.mean(raw_l ** 2)))
-            rms_r = math.sqrt(float(np.mean(raw_r ** 2)))
-            channel_sum = rms_l + rms_r
-            balance = (rms_r - rms_l) / (channel_sum + 0.000001)
+                    filtered = signal.lfilter(b, a, data, axis=0)
+                    raw_l = filtered[:, 0]
+                    raw_r = filtered[:, 1]
+                    
+                    rms_l = math.sqrt(float(np.mean(raw_l ** 2)))
+                    rms_r = math.sqrt(float(np.mean(raw_r ** 2)))
+                    channel_sum = rms_l + rms_r
+                    balance = (rms_r - rms_l) / (channel_sum + 0.000001)
 
-            sensitivity = settings.get("sensitivity", SENSITIVITY)
-            total = np.power(channel_sum * sensitivity, COMPRESSION)
-            
-            if is_moving:
-                total *= 0.45
+                    sensitivity = settings.get("sensitivity", SENSITIVITY)
+                    total = np.power(channel_sum * sensitivity, COMPRESSION)
+                    
+                    if is_moving:
+                        total *= 0.45
 
-            current_peak = min(total, 1.0)
-            current_confidence = clamp((abs(balance) * 0.45) + (current_peak * 0.55), 0.0, 1.0)
-            
-            is_back = False
-            centroid = 0.0
-            if total > 0.05:
-                freqs = np.fft.rfft(data[:, 0] + data[:, 1])
-                mags = np.abs(freqs)
-                if np.sum(mags) > 0:
-                    centroid = (np.sum(np.arange(len(mags)) * mags) / np.sum(mags)) * (SAMPLE_RATE / BLOCK_SIZE)
-                    if centroid < REAR_THRESHOLD: is_back = True
+                    current_peak = min(total, 1.0)
+                    current_confidence = clamp((abs(balance) * 0.45) + (current_peak * 0.55), 0.0, 1.0)
+                    
+                    is_back = False
+                    centroid = 0.0
+                    if total > 0.05:
+                        freqs = np.fft.rfft(data[:, 0] + data[:, 1])
+                        mags = np.abs(freqs)
+                        if np.sum(mags) > 0:
+                            centroid = (np.sum(np.arange(len(mags)) * mags) / np.sum(mags)) * (SAMPLE_RATE / BLOCK_SIZE)
+                            if centroid < REAR_THRESHOLD: is_back = True
 
-            noise_floor = settings.get("noise_floor", NOISE_FLOOR)
-            current_event = classify_audio_event(total, previous_level, centroid, noise_floor, is_moving=is_moving)
-            previous_level = (previous_level * 0.72) + (total * 0.28)
+                    noise_floor = settings.get("noise_floor", NOISE_FLOOR)
+                    current_event = classify_audio_event(total, previous_level, centroid, noise_floor, is_moving=is_moving)
+                    previous_level = (previous_level * 0.72) + (total * 0.28)
 
-            if total > noise_floor:
-                angle = direction_angle_from_balance(
-                    balance,
-                    is_back=is_back,
-                    swap_channels=settings.get("swap_channels", False)
-                )
-                val = min(total, 1.0)
-                target = build_sector_levels(angle, val, spread=settings.get("sector_spread", 2))
+                    if total > noise_floor:
+                        angle = direction_angle_from_balance(
+                            balance,
+                            is_back=is_back,
+                            swap_channels=settings.get("swap_channels", False)
+                        )
+                        val = min(total, 1.0)
+                        target = build_sector_levels(angle, val, spread=settings.get("sector_spread", 2))
 
-                for i in range(16):
-                    if target[i] > sector_data[i]: sector_data[i] = target[i]
-            
-            is_human = total > 0.6
+                        for i in range(16):
+                            if target[i] > sector_data[i]: sector_data[i] = target[i]
+                    
+                    is_human = total > 0.6
+        except Exception as e:
+            audio_status = "ERROR"
+            audio_error_message = str(e)
+            current_event = "AUDIO ERROR"
+            current_peak = 0.0
+            current_confidence = 0.0
+            sector_data = [0.0] * 16
+            log_message(f"Audio loop error: {e}")
+            time.sleep(2)
 
 # --- GUI ---
 class RadarOverlay:
@@ -890,7 +943,7 @@ class RadarOverlay:
         self.canvas.tag_bind(self.resize_grip, '<Leave>', lambda e: self.root.config(cursor="arrow"))
 
     def update_gui(self):
-        global sector_data, is_moving, is_human, current_peak, current_confidence, current_event
+        global sector_data, is_moving, is_human, current_peak, current_confidence, current_event, audio_status
         decay = 0.08
         active_color = self.profile["active"]
         danger_color = self.profile["danger"]
@@ -913,7 +966,10 @@ class RadarOverlay:
             if sector_data[s] > 0: sector_data[s] -= decay
             if sector_data[s] < 0: sector_data[s] = 0
 
-        if is_moving:
+        if audio_status == "ERROR":
+            status = "AUDIO ERROR"
+            icon_color = danger_color
+        elif is_moving:
             status = "MOVE"
             icon_color = muted_color
         elif is_human:

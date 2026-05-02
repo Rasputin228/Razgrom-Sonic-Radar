@@ -36,6 +36,7 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 overlay_debug.txt
+diagnostic_report.json
 
 # Unit test / coverage reports
 htmlcov/
