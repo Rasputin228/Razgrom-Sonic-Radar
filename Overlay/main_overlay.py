@@ -2,21 +2,39 @@ import sys
 import time
 import threading
 import math
-import traceback
 import ctypes
 from ctypes import wintypes
-import os
-import json
 
+from app_config import (
+    BLOCK_SIZE,
+    COMPRESSION,
+    COLOR_PROFILES,
+    DEFAULT_SETTINGS,
+    FREQ_HIGH,
+    FREQ_LOW,
+    NOISE_FLOOR,
+    PROFILE_PRESETS,
+    REAR_THRESHOLD,
+    SAMPLE_RATE,
+    SENSITIVITY,
+    TRANS_COLOR,
+    apply_saved_settings,
+    build_saved_config,
+    clamp,
+    load_config,
+    log_message,
+    save_config,
+)
 from audio_direction import build_sector_levels, direction_angle_from_balance, smooth_angle
 from audio_events import classify_audio_event
-
-# --- ЛОГГЕР ---
-def log_message(msg):
-    try:
-        with open("overlay_debug.txt", "a", encoding="utf-8") as f:
-            f.write(f"{msg}\n")
-    except: pass
+from audio_io import (
+    diagnose_audio_source,
+    get_audio_sources,
+    measure_noise_floor,
+    open_audio_recorder_source,
+    preflight_audio_source,
+    write_diagnostic_report,
+)
 
 def handle_exception(exc_type, exc_value, exc_traceback):
     sys.exit(1)
@@ -33,103 +51,7 @@ except Exception as e:
     log_message(f"Import Error: {e}")
     sys.exit(1)
 
-# --- НАСТРОЙКИ ---
-SAMPLE_RATE = 48000
-BLOCK_SIZE = 512
-FREQ_LOW = 40
-FREQ_HIGH = 5000
-SENSITIVITY = 350.0
-COMPRESSION = 0.4
-REAR_THRESHOLD = 1200
-NOISE_FLOOR = 0.018
-CONFIG_FILE = "config.json"
-DIAGNOSTIC_REPORT_FILE = "diagnostic_report.json"
-
-# ЦВЕТА
-TRANS_COLOR = "#000001"
-COLOR_GRID = "#444444"
-COLOR_ACTIVE = "#ff9900"
-COLOR_DANGER = "#ff3300"
-
-COLOR_PROFILES = {
-    "orange": {
-        "name": "Оранжевый",
-        "grid": "#444444",
-        "active": "#ff9900",
-        "danger": "#ff3300",
-        "muted": "#443300",
-        "text": "#ffcc66",
-    },
-    "blue": {
-        "name": "Сине-белый",
-        "grid": "#5f7288",
-        "active": "#4fd8ff",
-        "danger": "#ffffff",
-        "muted": "#1d3f4a",
-        "text": "#d9f6ff",
-    },
-    "contrast": {
-        "name": "Высокий контраст",
-        "grid": "#777777",
-        "active": "#ffff00",
-        "danger": "#ff0000",
-        "muted": "#555500",
-        "text": "#ffffff",
-    },
-}
-
-PROFILE_PRESETS = {
-    "Custom": {},
-    "CS2 / footsteps": {
-        "sensitivity": 420.0,
-        "noise_floor": 0.026,
-        "sector_spread": 2,
-        "visual_mode": "minimal",
-        "color_profile": "contrast",
-        "opacity": 0.82,
-    },
-    "Tarkov / tactical": {
-        "sensitivity": 520.0,
-        "noise_floor": 0.032,
-        "sector_spread": 3,
-        "visual_mode": "radar",
-        "color_profile": "orange",
-        "opacity": 0.78,
-    },
-    "Arena Breakout": {
-        "sensitivity": 470.0,
-        "noise_floor": 0.028,
-        "sector_spread": 2,
-        "visual_mode": "minimal",
-        "color_profile": "blue",
-        "opacity": 0.84,
-    },
-    "Desktop test": {
-        "sensitivity": 260.0,
-        "noise_floor": 0.018,
-        "sector_spread": 1,
-        "visual_mode": "radar",
-        "color_profile": "orange",
-        "opacity": 0.9,
-    },
-}
-
-settings = {
-    "profile_name": "Custom",
-    "sensitivity": SENSITIVITY,
-    "size": 320,
-    "opacity": 0.85,
-    "color_profile": "orange",
-    "show_labels": True,
-    "swap_channels": False,
-    "sector_spread": 2,
-    "noise_floor": NOISE_FLOOR,
-    "visual_mode": "radar",
-    "edge_indicators": True,
-    "direction_smoothing": 0.35,
-    "overlay_x": 100,
-    "overlay_y": 100,
-}
+settings = DEFAULT_SETTINGS.copy()
 
 # Глобальные переменные
 sector_data = [0.0] * 16
@@ -170,186 +92,11 @@ def get_open_windows():
     return sorted(list(set(titles)))
 
 
-def get_audio_sources():
-    sources = []
-    try:
-        for speaker in sc.all_speakers():
-            sources.append({
-                "label": f"OUTPUT LOOPBACK | {speaker.name}",
-                "name": speaker.name,
-                "kind": "loopback",
-            })
-    except Exception as e:
-        log_message(f"Speaker scan error: {e}")
-
-    try:
-        for mic in sc.all_microphones(include_loopback=False):
-            sources.append({
-                "label": f"MIC INPUT       | {mic.name}",
-                "name": mic.name,
-                "kind": "microphone",
-            })
-    except Exception as e:
-        log_message(f"Microphone scan error: {e}")
-
-    return sources
-
-
-def open_audio_recorder_source(source):
-    if source and source.get("kind") == "microphone":
-        return sc.get_microphone(id=str(source["name"]), include_loopback=False)
-
-    if source and source.get("kind") == "loopback":
-        return sc.get_microphone(id=str(source["name"]), include_loopback=True)
-
-    return sc.get_microphone(id=str(sc.default_speaker().name), include_loopback=True)
-
-# --- ЛАУНЧЕР ---
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        return {}
-    try:
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        log_message(f"Config read error: {e}")
-        return {}
-
-def save_config(config):
-    try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log_message(f"Config write error: {e}")
-
-def clamp(value, min_value, max_value):
-    return max(min_value, min(max_value, value))
-
-def apply_saved_settings(saved_config):
-    settings["profile_name"] = saved_config.get("profile_name", settings["profile_name"])
-    settings["sensitivity"] = float(saved_config.get("sensitivity", settings["sensitivity"]))
-    settings["size"] = int(saved_config.get("size", settings["size"]))
-    settings["opacity"] = float(saved_config.get("opacity", settings["opacity"]))
-    settings["color_profile"] = saved_config.get("color_profile", settings["color_profile"])
-    settings["show_labels"] = bool(saved_config.get("show_labels", settings["show_labels"]))
-    settings["swap_channels"] = bool(saved_config.get("swap_channels", settings["swap_channels"]))
-    settings["sector_spread"] = int(saved_config.get("sector_spread", settings["sector_spread"]))
-    settings["noise_floor"] = float(saved_config.get("noise_floor", settings["noise_floor"]))
-    settings["visual_mode"] = saved_config.get("visual_mode", settings["visual_mode"])
-    settings["edge_indicators"] = bool(saved_config.get("edge_indicators", settings["edge_indicators"]))
-    settings["direction_smoothing"] = float(saved_config.get("direction_smoothing", settings["direction_smoothing"]))
-    settings["overlay_x"] = int(saved_config.get("overlay_x", settings["overlay_x"]))
-    settings["overlay_y"] = int(saved_config.get("overlay_y", settings["overlay_y"]))
-    settings["sensitivity"] = clamp(settings["sensitivity"], 80.0, 900.0)
-    settings["size"] = int(clamp(settings["size"], 180, 800))
-    settings["opacity"] = clamp(settings["opacity"], 0.35, 1.0)
-    settings["sector_spread"] = int(clamp(settings["sector_spread"], 1, 3))
-    settings["noise_floor"] = clamp(settings["noise_floor"], 0.002, 0.25)
-    settings["direction_smoothing"] = clamp(settings["direction_smoothing"], 0.05, 1.0)
-    settings["overlay_x"] = int(clamp(settings["overlay_x"], -4000, 4000))
-    settings["overlay_y"] = int(clamp(settings["overlay_y"], -4000, 4000))
-    if settings["visual_mode"] not in ("radar", "minimal"):
-        settings["visual_mode"] = "radar"
-    if settings["color_profile"] not in COLOR_PROFILES:
-        settings["color_profile"] = "orange"
-    if settings["profile_name"] not in PROFILE_PRESETS:
-        settings["profile_name"] = "Custom"
-
-def build_saved_config(window, audio_source):
-    return {
-        "profile_name": settings["profile_name"],
-        "window": window,
-        "audio": audio_source.get("name") if audio_source else selected_speaker_id,
-        "audio_kind": audio_source.get("kind") if audio_source else "loopback",
-        "sensitivity": settings["sensitivity"],
-        "size": settings["size"],
-        "opacity": settings["opacity"],
-        "color_profile": settings["color_profile"],
-        "show_labels": settings["show_labels"],
-        "swap_channels": settings["swap_channels"],
-        "sector_spread": settings["sector_spread"],
-        "noise_floor": settings["noise_floor"],
-        "visual_mode": settings["visual_mode"],
-        "edge_indicators": settings["edge_indicators"],
-        "direction_smoothing": settings["direction_smoothing"],
-        "overlay_x": settings["overlay_x"],
-        "overlay_y": settings["overlay_y"],
-    }
-
-def measure_noise_floor(source, sensitivity, seconds=3.0):
-    levels = []
-    frames = max(1, int(seconds * SAMPLE_RATE / BLOCK_SIZE))
-    with open_audio_recorder_source(source).recorder(samplerate=SAMPLE_RATE, channels=2, blocksize=BLOCK_SIZE) as recorder:
-        for _ in range(frames):
-            data = recorder.record(numframes=BLOCK_SIZE)
-            channel_sum = math.sqrt(float(np.mean(data[:, 0] ** 2))) + math.sqrt(float(np.mean(data[:, 1] ** 2)))
-            levels.append(float(np.power(channel_sum * sensitivity, COMPRESSION)))
-
-    if not levels:
-        return NOISE_FLOOR
-
-    percentile = float(np.percentile(levels, 90))
-    return clamp(percentile * 1.7, 0.006, 0.25)
-
-def diagnose_audio_source(source, sensitivity, seconds=1.0):
-    levels = []
-    balances = []
-    centroids = []
-    frames = max(1, int(seconds * SAMPLE_RATE / BLOCK_SIZE))
-    with open_audio_recorder_source(source).recorder(samplerate=SAMPLE_RATE, channels=2, blocksize=BLOCK_SIZE) as recorder:
-        for _ in range(frames):
-            data = recorder.record(numframes=BLOCK_SIZE)
-            rms_l = math.sqrt(float(np.mean(data[:, 0] ** 2)))
-            rms_r = math.sqrt(float(np.mean(data[:, 1] ** 2)))
-            channel_sum = rms_l + rms_r
-            level = float(np.power(channel_sum * sensitivity, COMPRESSION))
-            balance = (rms_r - rms_l) / (channel_sum + 0.000001)
-            levels.append(level)
-            balances.append(balance)
-
-            freqs = np.fft.rfft(data[:, 0] + data[:, 1])
-            mags = np.abs(freqs)
-            mag_sum = np.sum(mags)
-            if mag_sum > 0:
-                centroids.append(float((np.sum(np.arange(len(mags)) * mags) / mag_sum) * (SAMPLE_RATE / BLOCK_SIZE)))
-
-    if not levels:
-        return {
-            "level": 0.0,
-            "peak": 0.0,
-            "balance": 0.0,
-            "centroid": 0.0,
-            "frames": 0,
-        }
-
-    return {
-        "level": float(np.mean(levels)),
-        "peak": float(np.max(levels)),
-        "balance": float(np.mean(balances)),
-        "centroid": float(np.mean(centroids)) if centroids else 0.0,
-        "frames": len(levels),
-    }
-
-def write_diagnostic_report(window, audio_source, last_report=None):
-    report = {
-        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "selected_window": window,
-        "selected_audio_source": audio_source,
-        "settings": settings.copy(),
-        "audio_status": audio_status,
-        "audio_error": audio_error_message,
-        "last_measurement": last_report,
-        "available_audio_sources": get_audio_sources(),
-    }
-    with open(DIAGNOSTIC_REPORT_FILE, "w", encoding="utf-8") as f:
-        json.dump(report, f, ensure_ascii=False, indent=2)
-    return os.path.abspath(DIAGNOSTIC_REPORT_FILE)
-
 def show_launcher():
     global target_window_title, selected_speaker_id, selected_audio_source
     
     saved_config = load_config()
-    apply_saved_settings(saved_config)
+    apply_saved_settings(settings, saved_config)
 
     root = tk.Tk()
     root.title("Razgrom Config")
@@ -566,6 +313,24 @@ def show_launcher():
     )
     diagnostics_button.pack(fill="x", pady=(0, 6))
 
+    def run_preflight_check(source):
+        calibration_status.config(text="Preflight: проверяю выбранный источник 1 секунду...", fg="#ffcc66")
+        root.update_idletasks()
+        ok, warnings, report = preflight_audio_source(
+            source,
+            float(sensitivity_var.get()),
+            float(noise_floor_var.get())
+        )
+        last_diagnostic_report["data"] = report
+        if not ok:
+            calibration_status.config(text="Preflight не пройден: " + " ".join(warnings), fg="#ff6666")
+            return False
+        if warnings:
+            calibration_status.config(text="Preflight: " + " ".join(warnings), fg="#ffcc66")
+        else:
+            calibration_status.config(text=f"Preflight OK | PEAK {report['peak']:.3f} | {report['centroid']:.0f} Hz", fg="#66ff99")
+        return True
+
     def export_diagnostic_report():
         try:
             window = list_win.get(list_win.curselection())
@@ -573,7 +338,7 @@ def show_launcher():
             window = ""
         source = selected_source_from_list()
         try:
-            path = write_diagnostic_report(window, source, last_diagnostic_report["data"])
+            path = write_diagnostic_report(window, source, settings, audio_status, audio_error_message, last_diagnostic_report["data"])
             calibration_status.config(text=f"Отчет сохранен: {path}", fg="#66ff99")
         except Exception as e:
             calibration_status.config(text=f"Отчет не сохранен: {e}", fg="#ff6666")
@@ -631,8 +396,11 @@ def show_launcher():
         settings["visual_mode"] = visual_mode_var.get()
         settings["edge_indicators"] = bool(edge_indicators_var.get())
         settings["direction_smoothing"] = float(direction_smoothing_var.get())
+
+        if not run_preflight_check(selected_audio_source):
+            return
         
-        save_config(build_saved_config(target_window_title, selected_audio_source))
+        save_config(build_saved_config(settings, target_window_title, selected_audio_source, selected_speaker_id))
         
         root.destroy()
 
