@@ -125,6 +125,7 @@ settings = {
     "sector_spread": 2,
     "noise_floor": NOISE_FLOOR,
     "visual_mode": "radar",
+    "edge_indicators": True,
     "overlay_x": 100,
     "overlay_y": 100,
 }
@@ -233,6 +234,7 @@ def apply_saved_settings(saved_config):
     settings["sector_spread"] = int(saved_config.get("sector_spread", settings["sector_spread"]))
     settings["noise_floor"] = float(saved_config.get("noise_floor", settings["noise_floor"]))
     settings["visual_mode"] = saved_config.get("visual_mode", settings["visual_mode"])
+    settings["edge_indicators"] = bool(saved_config.get("edge_indicators", settings["edge_indicators"]))
     settings["overlay_x"] = int(saved_config.get("overlay_x", settings["overlay_x"]))
     settings["overlay_y"] = int(saved_config.get("overlay_y", settings["overlay_y"]))
     settings["sensitivity"] = clamp(settings["sensitivity"], 80.0, 900.0)
@@ -264,6 +266,7 @@ def build_saved_config(window, audio_source):
         "sector_spread": settings["sector_spread"],
         "noise_floor": settings["noise_floor"],
         "visual_mode": settings["visual_mode"],
+        "edge_indicators": settings["edge_indicators"],
         "overlay_x": settings["overlay_x"],
         "overlay_y": settings["overlay_y"],
     }
@@ -407,6 +410,7 @@ def show_launcher():
     visual_mode_var = tk.StringVar(value=settings["visual_mode"])
     color_profile_var = tk.StringVar(value=settings["color_profile"])
     preset_var = tk.StringVar(value=settings["profile_name"])
+    edge_indicators_var = tk.BooleanVar(value=settings["edge_indicators"])
 
     preset_row = tk.Frame(settings_frame, bg="#111")
     preset_row.pack(fill="x", pady=(0, 6))
@@ -588,6 +592,11 @@ def show_launcher():
         bg="#111", fg="#ddd", activebackground="#111", activeforeground="#fff",
         selectcolor="#222"
     ).pack(anchor="w", pady=4)
+    tk.Checkbutton(
+        settings_frame, text="Показывать индикаторы по краям", variable=edge_indicators_var,
+        bg="#111", fg="#ddd", activebackground="#111", activeforeground="#fff",
+        selectcolor="#222"
+    ).pack(anchor="w", pady=4)
 
     def on_start():
         global target_window_title, selected_speaker_id, selected_audio_source
@@ -613,6 +622,7 @@ def show_launcher():
         settings["sector_spread"] = int(sector_spread_var.get())
         settings["noise_floor"] = float(noise_floor_var.get())
         settings["visual_mode"] = visual_mode_var.get()
+        settings["edge_indicators"] = bool(edge_indicators_var.get())
         
         save_config(build_saved_config(target_window_title, selected_audio_source))
         
@@ -768,10 +778,12 @@ class RadarOverlay:
         self.event_text = None
         self.peak_bar = None
         self.confidence_text = None
+        self.edge_gfx = {}
         self.last_config_save = 0
         self.menu = tk.Menu(root, tearoff=0, bg="#151515", fg="#eeeeee", activebackground="#333333")
         self.menu.add_command(label="Скрыть / показать подписи", command=self.toggle_labels)
         self.menu.add_command(label="Переключить HUD", command=self.toggle_visual_mode)
+        self.menu.add_command(label="Индикаторы по краям", command=self.toggle_edge_indicators)
         test_menu = tk.Menu(self.menu, tearoff=0, bg="#151515", fg="#eeeeee", activebackground="#333333")
         test_menu.add_command(label="Вперед", command=lambda: self.test_direction(0))
         test_menu.add_command(label="Вправо", command=lambda: self.test_direction(90))
@@ -829,6 +841,11 @@ class RadarOverlay:
         self.init_graphics()
         self.save_layout_throttled(force=True)
 
+    def toggle_edge_indicators(self):
+        settings["edge_indicators"] = not settings["edge_indicators"]
+        self.init_graphics()
+        self.save_layout_throttled(force=True)
+
     def test_direction(self, angle):
         global sector_data, current_peak, current_confidence, is_human
         test = build_sector_levels(angle, 1.0, spread=settings.get("sector_spread", 2))
@@ -850,6 +867,7 @@ class RadarOverlay:
             "overlay_y": int(settings["overlay_y"]),
             "show_labels": settings["show_labels"],
             "visual_mode": settings["visual_mode"],
+            "edge_indicators": settings["edge_indicators"],
         })
         save_config(saved)
 
@@ -877,6 +895,7 @@ class RadarOverlay:
     def init_graphics(self):
         self.canvas.delete("all")
         self.blocks_gfx = []
+        self.edge_gfx = {}
         self.profile = COLOR_PROFILES.get(settings["color_profile"], COLOR_PROFILES["orange"])
         cx, cy = self.width / 2, self.height / 2
         radius = min(cx, cy) - 10 
@@ -942,6 +961,25 @@ class RadarOverlay:
         self.canvas.tag_bind(self.resize_grip, '<Enter>', lambda e: self.root.config(cursor="sizing"))
         self.canvas.tag_bind(self.resize_grip, '<Leave>', lambda e: self.root.config(cursor="arrow"))
 
+        if settings["edge_indicators"]:
+            edge_width = max(int(radius * 0.08), 8)
+            pad = max(int(radius * 0.08), 8)
+            self.edge_gfx = {
+                "front": self.canvas.create_rectangle(pad, pad, self.width - pad, pad + edge_width, outline="", fill=TRANS_COLOR),
+                "right": self.canvas.create_rectangle(self.width - pad - edge_width, pad, self.width - pad, self.height - pad, outline="", fill=TRANS_COLOR),
+                "back": self.canvas.create_rectangle(pad, self.height - pad - edge_width, self.width - pad, self.height - pad, outline="", fill=TRANS_COLOR),
+                "left": self.canvas.create_rectangle(pad, pad, pad + edge_width, self.height - pad, outline="", fill=TRANS_COLOR),
+            }
+
+    def cardinal_levels(self):
+        groups = {
+            "front": [15, 0, 1],
+            "right": [3, 4, 5],
+            "back": [7, 8, 9],
+            "left": [11, 12, 13],
+        }
+        return {name: max(sector_data[index] for index in indexes) for name, indexes in groups.items()}
+
     def update_gui(self):
         global sector_data, is_moving, is_human, current_peak, current_confidence, current_event, audio_status
         decay = 0.08
@@ -991,6 +1029,13 @@ class RadarOverlay:
         if self.event_text:
             event_color = danger_color if current_event in ("IMPACT", "SHARP") else text_color
             self.canvas.itemconfigure(self.event_text, text=f"EVENT {current_event}", fill=event_color)
+        if self.edge_gfx:
+            for name, level in self.cardinal_levels().items():
+                if level <= 0.03:
+                    self.canvas.itemconfigure(self.edge_gfx[name], fill=TRANS_COLOR)
+                    continue
+                color = danger_color if current_event in ("IMPACT", "SHARP") and level > 0.5 else active_color
+                self.canvas.itemconfigure(self.edge_gfx[name], fill=color)
         if self.peak_bar:
             cx = self.width / 2
             radius = min(self.width, self.height) / 2 - 10
